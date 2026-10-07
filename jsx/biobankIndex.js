@@ -10,10 +10,7 @@ import Modal from '../../../jsx/Modal.tsx';
 import {
   FileElement,
 } from 'jsx/Form';
-
-
 import {clone, isEmpty, get, getStream, post} from './helpers.js';
-
 /**
  * The main React entrypoint for the biobank module. This component
  * renders the index page.
@@ -93,9 +90,6 @@ class BiobankIndex extends Component {
     this.handleSubmit = this.handleSubmit.bind(this);
     this.setFormData = this.setFormData.bind(this);
     this.postData = this.postData.bind(this);
-
-
-
   }
 
   /**
@@ -995,7 +989,6 @@ window.addEventListener('load', () => {
       labelAPI={`${biobank}labelendpoint/`}
       csvURL={`${loris.BaseURL}/biobank/CSVImport`}
       hasPermission={loris.userHasPermission}
-
     />,
     document.getElementById('lorisworkspace'));
 });

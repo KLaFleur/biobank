@@ -142,7 +142,7 @@ class CSVImport extends \LORIS\cbigr_api\Endpoint
      *
      * Row processing order:
      * 1. Check required fields (BARCODE, SPECIMEN_TYPE, PSCID, CONTAINER_TYPE,
-     *    UNIT, QUANTITY, PROTOCOL) are present => if not ERROR & SKIP
+     *    UNIT, QUANTITY, PROTOCOL, SPECIMEN_STATUS) are present => if not ERROR & SKIP
      * 2. Check if BARCODE is a duplicate within this file, or already exists
      *    in the DB (prior import / manual entry) => IGNORE & SKIP
      * 3. Run DataRowAddEdit::validate() on the row => if problem ERROR & SKIP
@@ -151,7 +151,7 @@ class CSVImport extends \LORIS\cbigr_api\Endpoint
      *    resolve ERROR & SKIP
      * 5. Check if PSCID matches an existing candidate => if not, CREATE one
      *    (requires SEX in the row)
-     * 6. Get or create the candidate's Biospecimen01 session
+     * 6. Get or create the candidate's session
      * 7. Determine the next SampleNumber for that session
      * 8. Insert biobank_container
      * 9. Insert biobank_specimen + biobank_specimen_collection
@@ -189,7 +189,6 @@ class CSVImport extends \LORIS\cbigr_api\Endpoint
             )
         );
         $defaultDOB = "1000-01-01";
-
         // $biobankProjectID = \Project::singleton(self::BIOBANK_PROJECT_NAME)->getId();
 
         /**
