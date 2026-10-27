@@ -33,10 +33,7 @@ class DataRowAddEdit extends \LORIS\cbigr_api\Endpoint
 
     protected function allowedMethods(): array
     {
-        return [
-            "POST",
-            "PUT",
-        ];
+        return [];
     }
 
     /**
@@ -50,75 +47,9 @@ class DataRowAddEdit extends \LORIS\cbigr_api\Endpoint
      */
     public function handle(ServerRequestInterface $request): ResponseInterface
     {
-        switch ($request->getMethod()) {
-            case "POST":
-                return $this->addSpecimenData($request);
-            case "PUT":
-                return $this->editSpecimenData($request);
-            default:
-                return (new \LORIS\Http\Response\JSON\MethodNotAllowed(
-                    ["POST","PUT"]
-                ));
-        }
-    }
-
-    /**
-     * Handles the document editing process
-     *
-     * @param ServerRequestInterface $request The incoming PSR7 request
-     *
-     * @return ResponseInterface
-     */
-    function addSpecimenData(ServerRequestInterface $request): ResponseInterface
-    {
-        // Commented because no FE adding functionality yet -- this endpoint
-        // is currently only exercised indirectly via CSVImport::parseCSV(),
-        // which calls DataRowAddEdit::validate() directly rather than
-        // hitting this route. Left as a stub matching the genomics module's
-        // pattern until a single-row add form exists for biobank specimens.
-
-        // $values = json_decode((string)$request->getBody(), true);
-        // $loris = $request->getAttribute('loris');
-        // $DB = $loris->getDatabaseConnection();
-
-        // $errors = $this->validate($values, $DB);
-        // if (empty($errors)) {
-        //     $DB->insert("biobank_container", ...);
-        //     return new \LORIS\Http\Response\JSON\Created(
-        //         ['message' => 'Created successfully']
-        //     );
-        // }
-
-        // return new \LORIS\Http\Response\JSON\InternalServerError(
-        //     "An unhandled exception prevented the data from being saved.
-        //     Please contact your administrator."
-        // );
-    }
-
-    /**
-     * Handles the document editing process
-     *
-     * @param ServerRequestInterface $request The incoming PSR7 request
-     *
-     * @return ResponseInterface
-     */
-    function editSpecimenData(ServerRequestInterface $request): ResponseInterface
-    {
-        // Commented because no FE editing functionality yet
-
-        // $values = json_decode((string)$request->getBody(), true);
-        // $loris = $request->getAttribute('loris');
-        // $DB = $loris->getDatabaseConnection();
-
-        // $barcode = $DB->pselectOne(
-        //     "SELECT Barcode FROM biobank_container WHERE Barcode=:barcode",
-        //     ["barcode"=>$values['BARCODE']]
-        // );
-        // if (empty($barcode)) {
-        //     return  new \LORIS\Http\Response\JSON\BadRequest(
-        //         "This specimen does not exist"
-        //     );
-        // }
+        return new \LORIS\Http\Response\JSON\MethodNotAllowed(
+            $this->allowedMethods()
+        );
     }
 
     /**
@@ -162,6 +93,7 @@ class DataRowAddEdit extends \LORIS\cbigr_api\Endpoint
             'VISIT_LABEL',
             'COLLECTION_DATE',
             'SPECIMEN_STATUS',
+            'COLLECTION_TECHNICIAN',
         ];
         if (!$allowBlankPSCID) {
             $required[] = 'PSCID';
@@ -319,6 +251,10 @@ class DataRowAddEdit extends \LORIS\cbigr_api\Endpoint
             $errors['QUANTITY'] = "must_be_positive ".$values['QUANTITY'];
         }
 
+        //validate temperature is in range 
+        if (isset($values['TEMPERATURE']) && is_numeric($values['TEMPERATURE']) && ((float) $values['TEMPERATURE'] < -273.15 || (float) $values['TEMPERATURE'] > 100)) {
+            $errors['TEMPERATURE'] = "must_be_between_-273.15_and_100. (inputed temperature: ".$values['TEMPERATURE'];
+        }
         // Validate dates
         $dateFields = [
             'COLLECTION_DATE',
@@ -331,52 +267,6 @@ class DataRowAddEdit extends \LORIS\cbigr_api\Endpoint
         }
 
         return $errors;
-    }
-
-    /**
-     * Check fields redundant with LORIS to make sure info matches. If not, return warnings
-     *
-     * NOTE: unlike the genomics module (where CandID is already known when
-     * this runs), CSVImport::parseCSV() may not yet have resolved or
-     * created a candidate for this row -- if a candidate exists, checks
-     * below run against their current DB values. If a candidate is being
-     * newly created, there is nothing yet to conflict against, so
-     * conflicts are only meaningful for pre-existing PSCIDs.
-     *
-     * @param array     $values Row values, keyed by data-dictionary column
-     * @param \Database $DB     Database
-     *
-     * @return array
-     */
-
-    static function detectConflicts(array $values, \Database $DB) : array
-    {
-        $conflicts = [];
-
-        if (!isset($values['PSCID'])) {
-            return $conflicts;
-        }
-
-        $candID = $DB->pselectOne(
-            "SELECT CandID FROM candidate WHERE PSCID = :pscid",
-            ["pscid" => $values['PSCID']]
-        );
-        if (empty($candID)) {
-            // New candidate -- nothing in the DB yet to conflict with.
-            return $conflicts;
-        }
-
-        if (isset($values['SEX'])) {
-            $sex = $DB->pselectOne(
-                "SELECT Sex FROM candidate WHERE CandID = :cid",
-                ["cid" => $candID]
-            );
-            if ($sex !== null && $sex !== $values['SEX']) {
-                $conflicts['SEX'] = "DB: $sex - CSV: ".$values['SEX'];
-            }
-        }
-
-        return $conflicts;
     }
 
     /**

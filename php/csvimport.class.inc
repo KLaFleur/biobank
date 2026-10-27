@@ -115,7 +115,12 @@ class CSVImport extends \LORIS\cbigr_api\Endpoint
         // can't rename file to append a date
         rename($fullPath,$fullPathDated);
 
-        $output = $this->parseCSV($fullPathDated, $logPathDated, $DB);
+        $output = $this->parseCSV(
+            $fullPathDated,
+            $logPathDated,
+            $DB,
+            $request->getAttribute('user')
+        );
 
         $body = [
             'message' => count($output['new'])." New Entries. ".
@@ -163,7 +168,12 @@ class CSVImport extends \LORIS\cbigr_api\Endpoint
      *
      * @return array $arr Array containing import results
      */
-    public function parseCSV(string $fullPathDated, string $logPathDated, \Database $DB) : array
+    public function parseCSV(
+        string $fullPathDated,
+        string $logPathDated,
+        \Database $DB,
+        \User $user
+    ) : array
     {
         $file = fopen($fullPathDated,"r");
         $headers = fgetcsv($file);
@@ -174,37 +184,41 @@ class CSVImport extends \LORIS\cbigr_api\Endpoint
         $new = [];
         $failed = false;
 
-        // New specimens are registered as Available by default.
-        $availableStatusID = $DB->pselectOne(
-            "SELECT ContainerStatusID FROM biobank_container_status WHERE Label = 'Available'",
-            []
-        );
-
-
         //TODO: do we want/need a fallback center for candidate creation? Genomics importer uses this but that may not be desired behavior.
-        $fallbackCenterID = new \CenterID(
-            $DB->pselectOne(
-                "SELECT CenterID FROM psc WHERE Name='Montreal Neurological Institute'",
-                []
-            )
-        );
-        $defaultDOB = "1000-01-01";
         // $biobankProjectID = \Project::singleton(self::BIOBANK_PROJECT_NAME)->getId();
 
         /**
          * ---- Lookup caches, loaded once before the loop ----
          */
-        // Candidate info needed both to resolve PSCID -> CandID and, for
-        // existing candidates, to source a center/project when creating
-        // their Biospecimen01 session if it doesn't exist yet.
+        // Candidate info is needed to source a center/project when creating
+        // a session for a candidate resolved by external ID.
         $candidateRows = $DB->pselect(
             "SELECT CandID, PSCID, RegistrationCenterID, RegistrationProjectID
              FROM candidate WHERE PSCID <> 'scanner'",
             []
         );
-        $candidateList = [];
+        $candidateById = [];
         foreach ($candidateRows as $c) {
-            $candidateList[$this->normalizeCsvKey($c['PSCID'])] = $c;
+            $candidateById[$c['CandID']] = $c;
+        }
+
+        $NBCextID = $DB->pselectOne(
+            "SELECT ProjectExternalID FROM Project_external WHERE Name = :name",
+            ['name' => 'NBC']
+        );
+        $externalIDRows = $DB->pselectColWithIndexKey(
+            "SELECT cper.ExtStudyID, MAX(cper.CandID) AS CandID
+             FROM candidate_project_extid_rel cper
+             JOIN Project_external pe
+               ON pe.ProjectExternalID = cper.ProjectExternalID
+             WHERE pe.Name = :name
+             GROUP BY cper.ExtStudyID",
+            ['name' => 'NBC'],
+            'ExtStudyID'
+        );
+        $externalIDList = [];
+        foreach ($externalIDRows as $externalID => $candID) {
+            $externalIDList[$this->normalizeCsvKey((string) $externalID)] = $candID;
         }
 
         $siteList = $DB->pselectColWithIndexKey(
@@ -297,12 +311,14 @@ class CSVImport extends \LORIS\cbigr_api\Endpoint
             $sessionList[$sessionKey] = $session['ID'];
         }
 
-        // Running per-session SampleNumber counters, seeded from current max.
+        // Running per-candidate SampleNumber counters, seeded from current max.
         $sampleNumberCounts = $DB->pselectColWithIndexKey(
-            "SELECT SessionID, MAX(SampleNumber) AS MaxNum
-             FROM biobank_specimen GROUP BY SessionID",
+            "SELECT s.CandID, MAX(bs.SampleNumber) AS MaxNum
+             FROM biobank_specimen bs
+             JOIN session s ON bs.SessionID = s.ID
+             GROUP BY s.CandID",
             [],
-            "SessionID"
+            "CandID"
         );
 
         $rowNumber = 1;
@@ -366,10 +382,6 @@ class CSVImport extends \LORIS\cbigr_api\Endpoint
                     )
                 );
             }
-            $candidateKey = $this->normalizeCsvKey($row['PSCID'] ?? '');
-            if (isset($candidateList[$candidateKey])) {
-                $row['PSCID'] = $candidateList[$candidateKey]['PSCID'];
-            }
             $ukey = $row['BARCODE'] ?? ('MISSING_BARCODE_'.uniqid());
             fwrite($logActive, $ukey."\n");
             error_log(
@@ -378,7 +390,7 @@ class CSVImport extends \LORIS\cbigr_api\Endpoint
             );
 
             // 1. Required fields present
-            foreach (['BARCODE','PROJECTS','SPECIMEN_TYPE','CONTAINER_TYPE','UNIT','QUANTITY','PROTOCOL', 'CURRENT_SITE', 'DRAW_SITE', 'VISIT_LABEL', 'SPECIMEN_STATUS'] as $required) {
+            foreach (['BARCODE','PROJECTS','SPECIMEN_TYPE','CONTAINER_TYPE','UNIT','QUANTITY','PROTOCOL', 'CURRENT_SITE', 'DRAW_SITE', 'VISIT_LABEL', 'SPECIMEN_STATUS', 'COLLECTION_TECHNICIAN'] as $required) {
                 if (!isset($row[$required])) {
                     $errors[$ukey]['missing_field'][] = $required;
                     $failed = true;
@@ -548,109 +560,36 @@ class CSVImport extends \LORIS\cbigr_api\Endpoint
                 fwrite($logActive, $ukey." --> DIAGNOSIS --> not found\n");
                 continue;
             }
-
-            // // 5. Resolve or create candidate
-            // $pscid = $row['PSCID'] ?? null;
-            // $DOB = $row['DOB'] ?? null;
-            // $candidateKey = $this->normalizeCsvKey($pscid ?? '');
-            // $candidateInfo = $candidateKey === ''
-            //     ? null
-            //     : ($candidateList[$candidateKey] ?? null);
-            // if ($candidateInfo === null) {
-            //     if (!isset($row['SEX'])) {
-            //         $errors[$ukey]['SEX'] = "SEX is required to create new candidate for PSCID '{$pscid}'";
-            //         fwrite($logActive, $ukey." --> SEX --> required for new candidate\n");
-            //         continue;
-            //     }
-
-            //     $newCandCenter = $currentSiteID !== null
-            //         ? new \CenterID((string) $currentSiteID)
-            //         : $fallbackCenterID;
-
-            //     try {
-            //         error_log(
-            //             '[CSVImport] CREATE candidate for row '.$ukey.': '.
-            //             json_encode(
-            //                 [
-            //                     'PSCID' => $pscid,
-            //                     'CenterID' => (string) $newCandCenter,
-            //                     'ProjectID' => $biobankProjectID,
-            //                     'Sex' => $row['SEX'],
-            //                 ],
-            //                 JSON_UNESCAPED_SLASHES
-            //             )
-            //         );
-            //     //TODO FIX CANDIDATE CREATION. replace Default DOB logic. Sex logic?
-            //         $cid = (string) \Candidate::createNew(
-            //             $newCandCenter,
-            //             $DOB,
-            //             null,
-            //             new Sex($row['SEX']),
-            //             //$pscid,
-            //             null,
-            //             new \ProjectID((string) $biobankProjectID),
-            //         );
-            //     } catch (\Exception $e) {
-            //         $errors[$ukey]['CANDIDATE'] = $e->getMessage();
-            //         fwrite($logActive, $ukey." --> CANDIDATE --> ".$e->getMessage()."\n");
-            //         continue;
-            //     }
-            //     fwrite($logActive, $ukey." --> New Candidate --> ".$cid."\n");
-
-            //     $candidateInfo = [
-            //         'CandID'                => $cid,
-            //         'PSCID'                 => $pscid,
-            //         'RegistrationCenterID'  => (int) (string) $newCandCenter,
-            //         'RegistrationProjectID' => $biobankProjectID,
-            //     ];
-            //     if ($candidateKey !== '') {
-            //         $candidateList[$candidateKey] = $candidateInfo;
-            //     }
-            // }
-            // $cid = $candidateInfo['CandID'];
-
-            // // 6. Resolve or create the session for the CSV-provided visit
-            // $sessionKey = $cid.'|'.$this->normalizeCsvKey($row['VISIT_LABEL']);
-            // $sessionID = $sessionList[$sessionKey] ?? null;
-            // if ($sessionID === null) {
-            //     try {
-            //         $sessionID = $this->createBiospecimenSession(
-            //             $DB,
-            //             (int) $cid,
-            //             (int) $candidateInfo['RegistrationCenterID'],
-            //             $biobankProjectID,
-            //             $row['VISIT_LABEL'],
-            //             $row['COLLECTION_DATE'] ?? date('Y-m-d')
-            //         );
-            //     } catch (\DatabaseException | \PDOException $e) {
-            //         $errors[$ukey]['SESSION'] = $e->getMessage();
-            //         fwrite($logActive, $ukey." --> SESSION --> ".$e->getMessage()."\n");
-            //         continue;
-            //     }
-            //     $sessionList[$sessionKey] = $sessionID;
-            //     fwrite($logActive, $ukey." --> New Session --> ".$sessionID."\n");
-            // }
-
-            // // 7. Next SampleNumber for this session
-            // $sampleNumberCounts[$sessionID] = ($sampleNumberCounts[$sessionID] ?? 0) + 1;
-            // $sampleNumber = $sampleNumberCounts[$sessionID];
-
             /**
              * 8/9/10. Insert data in respective tables
              */
+            $newCandidateCacheEntry = null;
+            $newExternalIDCacheEntry = null;
+            $newSessionCacheEntry = null;
             $DB->beginTransaction();
             try {
-                // 5. Resolve or create candidate
-                $pscid = $row['PSCID'] ?? null;
+                // 5. Resolve or create candidate using the NBC external ID.
+                $externalID = trim((string) ($row['PSCID'] ?? ''));
+                $externalIDKey = $this->normalizeCsvKey($externalID);
                 $DOB = $row['DOB'] ?? null;
-                $candidateKey = $this->normalizeCsvKey($pscid ?? '');
-                $candidateInfo = $candidateKey === ''
+                $candidateID = $externalIDKey === ''
                     ? null
-                    : ($candidateList[$candidateKey] ?? null);
+                    : ($externalIDList[$externalIDKey] ?? null);
+                $candidateInfo = $candidateID === null
+                    ? null
+                    : ($candidateById[$candidateID] ?? null);
+                if ($candidateID !== null && $candidateInfo === null) {
+                    $errors[$ukey]['EXTID'] =
+                        "NBC external ID '{$externalID}' references an unavailable candidate";
+                    fwrite($logActive, $ukey." --> EXTID --> candidate not found\n");
+                    $DB->rollBack();
+                    continue;
+                }
                 if ($candidateInfo === null) {
                     if (!isset($row['SEX'])) {
-                        $errors[$ukey]['SEX'] = "SEX is required to create new candidate for PSCID '{$pscid}'";
+                        $errors[$ukey]['SEX'] = "SEX is required to create new candidate for PSCID '{$externalID}'";
                         fwrite($logActive, $ukey." --> SEX --> required for new candidate\n");
+                        $DB->rollBack();
                         continue;
                     }
 
@@ -663,7 +602,7 @@ class CSVImport extends \LORIS\cbigr_api\Endpoint
                             '[CSVImport] CREATE candidate for row '.$ukey.': '.
                             json_encode(
                                 [
-                                    'PSCID' => $pscid,
+                                    'ExternalID' => $externalID,
                                     'CenterID' => (string) $newCandCenter,
                                     'ProjectID' => $biobankProjectID,
                                     'Sex' => $row['SEX'],
@@ -684,19 +623,40 @@ class CSVImport extends \LORIS\cbigr_api\Endpoint
                     } catch (\Exception $e) {
                         $errors[$ukey]['CANDIDATE'] = $e->getMessage();
                         fwrite($logActive, $ukey." --> CANDIDATE --> ".$e->getMessage()."\n");
+                        $DB->rollBack();
                         continue;
                     }
                     fwrite($logActive, $ukey." --> New Candidate --> ".$cid."\n");
 
+                    $externalIDData = [
+                        'CandID' => $cid,
+                        'ProjectExternalID' => $NBCextID,
+                        'ExtStudyID' => $externalID,
+                    ];
+                    $this->logDatabaseInsert(
+                        'candidate_project_extid_rel',
+                        $externalIDData,
+                        $ukey
+                    );
+                    $DB->unsafeinsert(
+                        'candidate_project_extid_rel',
+                        $externalIDData
+                    );
+
                     $candidateInfo = [
                         'CandID'                => $cid,
-                        'PSCID'                 => $pscid,
+                        'PSCID'                 => null,
                         'RegistrationCenterID'  => (int) (string) $newCandCenter,
                         'RegistrationProjectID' => $biobankProjectID,
                     ];
-                    if ($candidateKey !== '') {
-                        $candidateList[$candidateKey] = $candidateInfo;
-                    }
+                    $newCandidateCacheEntry = [
+                        'id' => $cid,
+                        'info' => $candidateInfo,
+                    ];
+                    $newExternalIDCacheEntry = [
+                        'key' => $externalIDKey,
+                        'id' => $cid,
+                    ];
                 }
                 $cid = $candidateInfo['CandID'];
 
@@ -711,20 +671,25 @@ class CSVImport extends \LORIS\cbigr_api\Endpoint
                             (int) $candidateInfo['RegistrationCenterID'],
                             $biobankProjectID,
                             $row['VISIT_LABEL'],
-                            $row['COLLECTION_DATE'] ?? date('Y-m-d')
+                            $row['COLLECTION_DATE'] ?? date('Y-m-d'),
+                            $user
                         );
                     } catch (\DatabaseException | \PDOException $e) {
                         $errors[$ukey]['SESSION'] = $e->getMessage();
                         fwrite($logActive, $ukey." --> SESSION --> ".$e->getMessage()."\n");
+                        $DB->rollBack();
                         continue;
                     }
-                    $sessionList[$sessionKey] = $sessionID;
+                    $newSessionCacheEntry = [
+                        'key' => $sessionKey,
+                        'id' => $sessionID,
+                    ];
                     fwrite($logActive, $ukey." --> New Session --> ".$sessionID."\n");
                 }
 
                 // 7. Next SampleNumber for this session
-                $sampleNumberCounts[$sessionID] = ($sampleNumberCounts[$sessionID] ?? 0) + 1;
-                $sampleNumber = $sampleNumberCounts[$sessionID];
+                $sampleNumberCounts[$cid] = ($sampleNumberCounts[$cid] ?? 0) + 1;
+                $sampleNumber = $sampleNumberCounts[$cid];
                 $containerData = [
                     'Barcode'           => $row['BARCODE'],
                     'ContainerTypeID'   => $containerTypeID,
@@ -774,15 +739,21 @@ class CSVImport extends \LORIS\cbigr_api\Endpoint
                 $DB->unsafeinsert('biobank_specimen_collection', $collectionData);
 
                 foreach ($diagnosisIDs as $did) {
-                    // (CandID, DiagnosisID) is the PK on candidate_diagnosis_rel,
-                    // so re-linking an existing diagnosis would throw -- check
-                    // first rather than catch-and-ignore.
-                    $exists = $DB->pselectOne(
+                    // Insert only the first diagnosis for a candidate.
+                    //TODO: Log entry not working for rows where diagnosis!=existing diagnosis (logic is fine)
+                    $existingDiagnosis = $DB->pselectOne(
+                        "SELECT d.Name
+                         FROM candidate_diagnosis_rel cdr
+                         JOIN diagnosis d ON d.DiagnosisID = cdr.DiagnosisID
+                         WHERE cdr.CandID = :cid",
+                        ['cid' => $cid]
+                    );
+                    $diagnosisAlreadyRegistered = $DB->pselectOne(
                         "SELECT COUNT(*) FROM candidate_diagnosis_rel
                          WHERE CandID = :cid AND DiagnosisID = :did",
                         ['cid' => $cid, 'did' => $did]
                     );
-                    if (!$exists) {
+                    if (!$existingDiagnosis) {
                         $diagnosisData = ['CandID' => $cid, 'DiagnosisID' => $did];
                         $this->logDatabaseInsert(
                             'candidate_diagnosis_rel',
@@ -790,6 +761,20 @@ class CSVImport extends \LORIS\cbigr_api\Endpoint
                             $ukey
                         );
                         $DB->unsafeinsert('candidate_diagnosis_rel', $diagnosisData);
+                    } else if (!$diagnosisAlreadyRegistered && $existingDiagnosis) {
+                        $diagnosisName = array_search(
+                            $did,
+                            $diagnosisList
+                        );
+                        if ($diagnosisName === false) {
+                            $diagnosisName = (string) $did;
+                        }
+                        fwrite(
+                            $logActive,
+                            $ukey.' --> Diagnosis '.$diagnosisName.
+                            ' not inserted, candidate has existing diagnosis '.$
+                            $existingDiagnosis."\n"
+                        );
                     }
                 }
 
@@ -800,7 +785,7 @@ class CSVImport extends \LORIS\cbigr_api\Endpoint
                 $DB->rollBack();
                 // Roll the SampleNumber counter back too, since this row's
                 // number was never actually consumed.
-                $sampleNumberCounts[$sessionID]--;
+                $sampleNumberCounts[$cid]--;
                 $errors[$ukey]['SQL'] = $e->getMessage();
                 fwrite($logActive, $ukey." --> SQL --> ".$e->getMessage()."\n");
                 error_log(
@@ -810,6 +795,18 @@ class CSVImport extends \LORIS\cbigr_api\Endpoint
                 continue;
             }
             $DB->commit();
+            if ($newCandidateCacheEntry !== null) {
+                $candidateById[$newCandidateCacheEntry['id']] =
+                    $newCandidateCacheEntry['info'];
+            }
+            if ($newExternalIDCacheEntry !== null) {
+                $externalIDList[$newExternalIDCacheEntry['key']] =
+                    $newExternalIDCacheEntry['id'];
+            }
+            if ($newSessionCacheEntry !== null) {
+                $sessionList[$newSessionCacheEntry['key']] =
+                    $newSessionCacheEntry['id'];
+            }
             error_log('[CSVImport] Database inserts committed for row '.$ukey);
         }
 
@@ -929,14 +926,15 @@ class CSVImport extends \LORIS\cbigr_api\Endpoint
         int $centerID,
         int $projectID,
         string $visitLabel,
-        string $visitDate
+        string $visitDate,
+        \User $user
     ) : int {
         $sessionData = [
             'CandID'       => $candID,
             'CenterID'     => $centerID,
             'ProjectID'    => $projectID,
             'Visit_label'  => $visitLabel,
-            'UserID'       => 'CSVImport',
+            'UserID'       => $user->getId(),
             'Active'       => 'Y',
             'Submitted'    => 'N',
             'Current_stage' => 'Not Started',

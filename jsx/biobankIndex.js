@@ -976,6 +976,7 @@ BiobankIndex.propTypes = {
   optionsAPI: PropTypes.object.isRequired,
   labelAPI: PropTypes.object.isRequired,
   csvURL: PropTypes.string.isRequired,
+  hasPermission: PropTypes.func.isRequired,
 };
 
 window.addEventListener('load', () => {
